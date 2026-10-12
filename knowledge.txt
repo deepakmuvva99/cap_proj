@@ -1,0 +1,194 @@
+================================================================================
+AI INVOICE AUDITOR – COMPREHENSIVE ARCHITECTURAL & TECHNICAL KNOWLEDGE BASE
+================================================================================
+Target Audience: AI Systems, Technical Evaluators, Ingestion for RAG / LLM Agents
+Version: 1.0.0 (Production Architecture)
+Environment: Containerized Multi-Service Distributed System (Docker Compose v2)
+================================================================================
+
+1. SYSTEM OVERVIEW & BUSINESS CONTEXT
+--------------------------------------------------------------------------------
+The system is an enterprise agentic AI solution for global logistics operations 
+that receive hundreds of daily vendor invoices in heterogeneous formats 
+(PDF, DOCX, scanned PNG) and diverse languages (English, German, Spanish).
+The platform autonomously:
+  1. Detects and deduplicates arriving files using SHA-256 binary checksums.
+  2. Extracts raw and structured content with OCR fallback.
+  3. Detects source language and translates to English via AWS Bedrock models.
+  4. Validates invoice completeness and internal arithmetic against rules.yaml.
+  5. Cross-references line items, quantities, prices, and currencies against 
+     an ERP master service over an isolated HTTP service boundary.
+  6. Persists audit trails in PostgreSQL 16 across 3 separate schemas.
+  7. Indexes invoice text and audit reports into Qdrant vector database.
+  8. Provides natural-language Q&A through a reflective RAG pipeline judged on 
+     the RAG Triad (Context Relevance, Groundedness, Answer Relevance >= 0.70).
+  9. Provides a Streamlit human-in-the-loop web dashboard for non-destructive 
+     feedback and on-demand re-validation.
+
+2. SERVICE TOPOLOGY & PORT MAPPINGS
+--------------------------------------------------------------------------------
+The application is deployed across 6 containers on a user-defined bridge network 
+named "invoice-net" (subnet managed by Docker Compose). All inter-service calls 
+resolve through internal Docker DNS names.
+
++---------------+--------------------+-----------+---------------------------------+
+| Service Name  | Host:Container Port| Image Base| Primary Responsibility          |
++---------------+--------------------+-----------+---------------------------------+
+| postgres      | 5432:5432          |postgres:16| Relational System of Record     |
+| qdrant        | 6333:6333          |qdrant:v1.9| Vector DB for RAG Index         |
+| redis         | 6379:6379          |redis:7-alp| Ephemeral LLM & Trans Cache     |
+| mock-erp      | 8001:8000          |python:3.11| FastAPI ERP Master Lookups      |
+| agent         | 8000:8000          |python:3.11| LangGraph Audit Engine & RAG    |
+| streamlit-ui  | 8501:8501          |python:3.11| Auditor Web Interface (HIL)     |
++---------------+--------------------+-----------+---------------------------------+
+
+3. ARCHITECTURAL SERVICE BOUNDARIES & DATA DESIGN
+--------------------------------------------------------------------------------
+1. Single Writer Principle:
+   The `agent` service is the ONLY service permitted to write audit records, 
+   line items, and discrepancies.
+2. ERP Service Boundary Isolation:
+   Although `agent` and `postgres` are co-located on the same network, `agent` 
+   is strictly prohibited from querying the `erp` schema in PostgreSQL directly. 
+   All ERP data must be fetched via HTTP GET:
+     - GET http://mock-erp:8000/po/{po_number}
+     - GET http://mock-erp:8000/vendor/{vendor_id}
+     - GET http://mock-erp:8000/sku/{sku_code}
+3. Derived Vector Store (Qdrant):
+   Qdrant vectors are derived entirely from text stored in PostgreSQL. If the 
+   Qdrant volume is wiped, running `POST http://agent:8000/rebuild-index` 
+   rebuilds the index from PostgreSQL text without repeating OCR.
+4. Disposable Cache (Redis):
+   Caches only ephemeral data: `llm:{sha256(prompt)}` and translations. Wiping 
+   Redis causes performance degradation, never data loss.
+5. Non-Destructive Corrections:
+   Human corrections from Streamlit are stored as INSERTs into 
+   `audit.human_feedback`, never overwriting original extracted text.
+
+4. DATABASE SCHEMAS (PostgreSQL 16)
+--------------------------------------------------------------------------------
+A single database (`invoicedb`) hosts three distinct schemas:
+
+Schema 1: `erp` (Owned by mock-erp)
+  - `erp.vendors`: vendor_id (PK), vendor_name, country, currency
+  - `erp.sku_master`: item_code (PK), category, uom, gst_rate
+  - `erp.purchase_orders`: po_number (PK), vendor_id (FK), created_at
+  - `erp.po_line_items`: id (PK), po_number (FK), item_code (FK), description,
+    qty (NUMERIC(12,3)), unit_price (NUMERIC(14,4)), currency
+
+Schema 2: `audit` (Owned by agent; read by streamlit-ui)
+  - `audit.invoice_audit`:
+      invoice_id (UUID PK), file_path, file_checksum (UNIQUE), extraction_method,
+      raw_extracted_text (TEXT), translated_text (TEXT), source_language,
+      translation_confidence (NUMERIC(4,3)), invoice_number, vendor_name,
+      po_number, invoice_date (DATE), currency (CHAR(3)), total_amount (NUMERIC),
+      subtotal (NUMERIC), tax_amount (NUMERIC), validation_status, recommendation,
+      extracted_raw (JSONB), thread_id, processed_at (TIMESTAMPTZ)
+  - `audit.invoice_line_items`:
+      id (PK), invoice_id (FK), line_number, item_code, description,
+      quantity (NUMERIC(12,3)), unit_price (NUMERIC(14,4)), line_total (NUMERIC(14,2))
+  - `audit.discrepancies`:
+      id (PK), invoice_id (FK), field_name, invoice_value, erp_value,
+      deviation_pct (NUMERIC(8,4)), severity (low|medium|high|critical), detected_at
+  - `audit.human_feedback`:
+      id (PK), invoice_id (FK), field_name, original_value, corrected_value,
+      corrected_by, corrected_at, revalidated (BOOLEAN)
+
+Schema 3: `langgraph` (Owned by agent)
+  - Stores graph checkpoints, blobs, and task writes for LangGraph memory.
+
+5. AI & AWS BEDROCK SPECIFICATIONS
+--------------------------------------------------------------------------------
+Integration is built with `langchain_aws` using `ChatBedrockConverse` and `BedrockEmbeddings`:
+  - Reasoning & Data Extraction: Amazon Nova Lite (`amazon.nova-lite-v1:0`)
+  - Multilingual Translation: Cohere Command R+ (`cohere.command-r-plus-v1:0`)
+  - RAG Generation: Cohere Command R+ (`cohere.command-r-plus-v1:0`)
+  - Vector Embeddings: Amazon Titan Embed Text v2 (`amazon.titan-embed-text-v2:0`)
+  - Temperature: 0.0 for deterministic reasoning/extraction; 0.1 for RAG generation.
+  - Built-in Mock Fallback: When AWS credentials are not set, a deterministic 
+    domain-specific mock client ensures container workflows run without crashes.
+
+6. INGESTION, EXTRACTION & ROUTING
+--------------------------------------------------------------------------------
+File Router:
+  - Input Volume: `/data/incoming`
+  - Computes binary SHA-256 hash.
+  - Queries `audit.invoice_audit` for existing checksum. Skips if already audited.
+  - Reads accompanying `.meta.json` if available.
+Parsers:
+  - PDF: Direct text via `pdfplumber`. If text length < 30 chars (scanned PDF),
+    falls back to OCR via `pdf2image` + `pytesseract` (eng+deu+spa).
+  - DOCX: Paragraphs and table cell extraction via `python-docx`.
+  - PNG/JPG/TIFF: Image preprocessing via Pillow and OCR via `pytesseract`.
+Field Extraction:
+  - Heuristic regex patterns for numbers, dates, currency symbols, and line items.
+  - Secondary LLM parser via Amazon Nova Lite for unstructured text.
+
+7. VALIDATION ENGINE (config/rules.yaml)
+--------------------------------------------------------------------------------
+1. Invoice Data Validation:
+   - Header Mandatory Fields: `invoice_no`, `invoice_date`, `vendor_id`, `currency`, `total_amount`.
+   - Line Item Mandatory Fields: `item_code`, `description`, `qty`, `unit_price`, `total`.
+   - Currency: Must be in `[USD, EUR, INR, GBP]` (symbols mapped: $, €, ₹, £).
+   - Date: Rejects dates > 7 days in future; flags invoices > 365 days old.
+   - Line Math: `abs(qty * unit_price - line_total) / line_total * 100 <= 1%`.
+   - Total Math: `abs(sum(line_totals) + tax - total_amount) <= 1.0 currency unit`.
+2. Business Validation (Mock ERP HTTP cross-reference):
+   - PO Lookup: `GET http://mock-erp:8000/po/{po_number}`.
+   - Vendor Match: invoice vendor must match PO vendor.
+   - Line Item Matching: by `item_code`.
+   - Quantity Tolerance: 0% deviation allowed.
+   - Unit Price Tolerance: ±5% deviation allowed (`abs(inv_price - erp_price) / erp_price * 100`).
+3. Recommendation Engine:
+   - `approve`: Zero discrepancies, valid currency, complete fields, translation conf >= 0.95.
+   - `review`: Medium/high discrepancies, math mismatches, missing fields, or conf < 0.95.
+   - `reject`: Invalid currency, PO not found, severe vendor mismatch, critical severity.
+
+8. RAG PIPELINE & RAG TRIAD REFLECTION
+--------------------------------------------------------------------------------
+Implemented as a specialized LangGraph workflow:
+  - Vector Store: Qdrant collection `invoice_audit_rag` (1024-dim, Cosine distance).
+  - Payloads per vector:
+      `invoice_id`, `invoice_number`, `vendor`, `source_type` (raw_invoice | audit_report),
+      `language`, `chunk_text`.
+  - Nodes:
+      1. `retrieval`: vector similarity search with optional `invoice_id` filter.
+      2. `augmentation`: structures context separating raw invoice text & audit findings.
+      3. `generation`: answers via Cohere Command R+ (checks Redis cache `llm:{sha256}`).
+      4. `reflection`: evaluates generation on 3 metrics (0.0 to 1.0):
+           * Context Relevance
+           * Groundedness (Faithfulness)
+           * Answer Relevance
+  - Conditional Edge:
+      If `average_score >= 0.70`, return answer to user.
+      If `average_score < 0.70` and `retry_count < 3`, expand retrieval depth (k) 
+      and retry generation.
+
+9. REPOSITORY ARTIFACT DIRECTORY STRUCTURE
+--------------------------------------------------------------------------------
+Capstone_Project/
+├── compose.yaml                - Docker Compose v2 specification
+├── docker-compose.yml          - Compatibility compose file
+├── .env.example / .env         - Environment configuration
+├── README.md                   - Complete user & verification guide
+├── slides.md                   - 5-Slide presentation with ASCII diagram
+├── config/rules.yaml           - Audit rules and tolerances
+├── config/personas.yaml        - Agent prompt templates & persona definitions
+├── db/init.sql                 - Postgres seed script with 3 schemas
+├── db/erp_schema.sql           - ERP tables definition
+├── db/audit_schema.sql         - Audit tables definition
+├── mock_erp/                   - FastAPI microservice on host 8001 / container 8000
+│   ├── Dockerfile, requirements.txt, .dockerignore
+│   └── app/ (main.py, database.py, models.py)
+├── agent/                      - LangGraph engine on port 8000
+│   ├── Dockerfile, requirements.txt, .dockerignore
+│   └── app/ (main.py, config.py, db.py, cache.py)
+│       ├── llm/ (bedrock.py, prompts.py)
+│       ├── extractors/ (router.py, pdf_extractor.py, docx_extractor.py, image_extractor.py)
+│       ├── workflow/ (state.py, nodes_*.py, graph.py)
+│       └── rag/ (vector_store.py, indexing.py, state.py, reflection.py, graph.py)
+├── streamlit_ui/               - Web dashboard on port 8501
+│   ├── Dockerfile, requirements.txt, .dockerignore
+│   └── app/ (main.py, db.py, api_client.py)
+└── tests/                      - Unit tests for extraction, validation, and RAG
+================================================================================

@@ -1,0 +1,48 @@
+# # Environment variables & secrets (CRITICAL: NEVER COMMIT CREDENTIALS)
+# .env
+# .env.local
+# .env.*.local
+# *.env
+
+# # Python caches & build artifacts
+# __pycache__/
+# *.py[cod]
+# *$py.class
+# *.so
+# .Python
+# build/
+# develop-eggs/
+# dist/
+# downloads/
+# eggs/
+# .eggs/
+# lib/
+# lib64/
+# parts/
+# sdist/
+# var/
+# wheels/
+# *.egg-info/
+# .installed.cfg
+# *.egg
+
+# # Virtual environments
+# venv/
+# .venv/
+# ENV/
+# env/
+
+# # IDE files
+# .vscode/
+# .idea/
+# *.swp
+# *.swo
+
+# # Temporary outputs & logs
+# outputs/reports/*.json
+# outputs/reports/*.html
+# logs/*.log
+
+# # OS generated files
+# .DS_Store
+# Thumbs.db

@@ -1,0 +1,35 @@
+# Web & Async Framework
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.4
+pydantic-settings==2.2.1
+requests==2.31.0
+httpx==0.27.0
+pyyaml==6.0.1
+python-dotenv==1.0.1
+
+# Database & Caching
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.29
+redis==5.0.3
+
+# LangChain & LangGraph & AWS Bedrock
+langchain==0.2.16
+langchain-core==0.2.38
+langchain-community==0.2.16
+langchain-aws==0.1.17
+langgraph==0.2.20
+boto3==1.34.131
+botocore==1.34.131
+
+# Vector Database
+qdrant-client==1.9.0
+
+# Document Extraction & OCR
+pdfplumber==0.11.0
+pypdf==4.2.0
+pdf2image==1.17.0
+pytesseract==0.3.10
+python-docx==1.1.0
+Pillow==10.3.0
+langdetect==1.0.9
